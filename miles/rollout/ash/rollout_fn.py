@@ -102,10 +102,13 @@ class AshRolloutFn:
             rollout_id=rollout_id,
             weight_version=weight_version,
         )
-        submitted = False
+        submission_attempted = False
         try:
+            # The server may have accepted the deterministic job ID even when
+            # the POST response is lost.  Cleanup must therefore follow every
+            # submission attempt, not only acknowledged submissions.
+            submission_attempted = True
             submission = await client.submit(request)
-            submitted = True
             if submission.rollout_job_id != request.rollout_job_id:
                 raise ValueError(
                     f"Ash accepted rollout_job_id={submission.rollout_job_id!r}; "
@@ -123,10 +126,9 @@ class AshRolloutFn:
             if samples_need_reward:
                 await batched_async_rm(self._args, samples_need_reward, inplace_set_reward_field=True)
             return samples, result
-        except BaseException:
-            if submitted:
-                await _cancel_without_masking_error(client, request.rollout_job_id)
-            raise
+        finally:
+            if submission_attempted:
+                await _delete_without_masking_error(client, request.rollout_job_id)
 
     def _build_request(
         self,
@@ -324,12 +326,18 @@ def _validate_result_contract(request: AshRolloutRequest, result: AshRolloutResu
             )
 
 
-async def _cancel_without_masking_error(client: AshRolloutClient, rollout_job_id: str) -> None:
-    cancel_task = asyncio.create_task(client.cancel(rollout_job_id))
+async def _delete_without_masking_error(client: AshRolloutClient, rollout_job_id: str) -> None:
+    delete_task = asyncio.create_task(client.delete(rollout_job_id))
     try:
-        await asyncio.shield(cancel_task)
-    except BaseException as error:
-        logger.warning("Failed to cancel Ash rollout %s during cleanup: %r", rollout_job_id, error)
+        await asyncio.shield(delete_task)
+    except asyncio.CancelledError:
+        try:
+            await delete_task
+        except Exception as error:
+            logger.warning("Failed to delete Ash rollout %s during cancellation: %r", rollout_job_id, error)
+        raise
+    except Exception as error:
+        logger.warning("Failed to delete Ash rollout %s during cleanup: %r", rollout_job_id, error)
 
 
 def _collect_metrics(results) -> dict[str, int | float]:

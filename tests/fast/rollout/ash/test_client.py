@@ -1,6 +1,8 @@
 import asyncio
 
 import httpx
+import pytest
+from pydantic import ValidationError
 
 from miles.rollout.ash.client import AshRolloutClient
 from miles.rollout.ash.protocol import AshRolloutBudget, AshRolloutRequest, AshSampleSlot
@@ -21,7 +23,19 @@ def _request():
     )
 
 
-def test_client_submit_get_and_cancel():
+def test_v1_request_rejects_unknown_or_empty_endpoint_fields():
+    payload = _request().model_dump(mode="json")
+    payload["future_request_field"] = True
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        AshRolloutRequest.model_validate(payload)
+
+    payload.pop("future_request_field")
+    payload["session_server_endpoint"] = ""
+    with pytest.raises(ValidationError, match="at least 1 character"):
+        AshRolloutRequest.model_validate(payload)
+
+
+def test_client_submit_get_and_delete():
     methods = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -36,6 +50,15 @@ def test_client_submit_get_and_cancel():
                 },
             )
         status = "cancelled" if request.method == "DELETE" else "running"
+        if request.method == "DELETE":
+            return httpx.Response(
+                200,
+                json={
+                    "protocol_version": "ash-rollout-v1",
+                    "rollout_job_id": "job-1",
+                    "status": status,
+                },
+            )
         return httpx.Response(
             200,
             json={
@@ -55,16 +78,16 @@ def test_client_submit_get_and_cancel():
         try:
             submission = await client.submit(_request())
             running = await client.get_result("job-1")
-            cancelled = await client.cancel("job-1")
-            return submission, running, cancelled
+            deleted = await client.delete("job-1")
+            return submission, running, deleted
         finally:
             await async_client.aclose()
 
-    submission, running, cancelled = asyncio.run(exercise_client())
+    submission, running, deleted = asyncio.run(exercise_client())
 
     assert submission.status == "queued"
     assert running.status == "running"
-    assert cancelled.status == "cancelled"
+    assert deleted.status == "cancelled"
     assert methods == [
         ("POST", "/rollout-groups"),
         ("GET", "/rollout-groups/job-1"),

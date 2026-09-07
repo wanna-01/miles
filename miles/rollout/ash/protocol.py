@@ -31,9 +31,9 @@ class AshRolloutRequest(FrozenStrictBaseModel):
     prompt: str | list[dict[str, Any]]
     prompt_token_ids: list[int] = Field(min_length=1)
     model_endpoint: str = Field(min_length=1)
-    session_server_endpoint: str | None = None
-    model: str | None = None
-    expected_weight_version: str | None = None
+    session_server_endpoint: str | None = Field(default=None, min_length=1)
+    model: str | None = Field(default=None, min_length=1)
+    expected_weight_version: str | None = Field(default=None, min_length=1)
     return_rollout_logprobs: bool = False
     sampling_params: dict[str, Any] = Field(default_factory=dict)
     budgets: AshRolloutBudget
@@ -101,6 +101,12 @@ class AshRolloutSubmission(FrozenStrictBaseModel):
     protocol_version: Literal[ASH_ROLLOUT_PROTOCOL_VERSION] = ASH_ROLLOUT_PROTOCOL_VERSION
     rollout_job_id: str = Field(min_length=1)
     status: Literal["queued", "running"]
+
+
+class AshRolloutDeletion(FrozenStrictBaseModel):
+    protocol_version: Literal[ASH_ROLLOUT_PROTOCOL_VERSION] = ASH_ROLLOUT_PROTOCOL_VERSION
+    rollout_job_id: str = Field(min_length=1)
+    status: Literal["completed", "early_stopped", "failed", "cancelled"]
 
 
 class AshRolloutResult(FrozenStrictBaseModel):

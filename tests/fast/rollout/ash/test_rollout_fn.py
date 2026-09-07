@@ -88,6 +88,7 @@ def _trajectory(slot, *, token, include_log_probs):
 def test_rollout_fn_submits_group_polls_and_imports_samples():
     submitted_request = None
     polls = 0
+    deleted = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal submitted_request, polls
@@ -102,6 +103,9 @@ def test_rollout_fn_submits_group_polls_and_imports_samples():
                 },
             )
 
+        if request.method == "DELETE":
+            deleted.append(request.url.path)
+            return httpx.Response(200, json=_deletion(submitted_request, status="completed"))
         polls += 1
         if polls == 1:
             return httpx.Response(200, json=_result(submitted_request, status="running"))
@@ -121,6 +125,7 @@ def test_rollout_fn_submits_group_polls_and_imports_samples():
     assert [sample.index for sample in output.samples[0]] == [11, 12]
     assert all(sample.status == Sample.Status.COMPLETED for sample in output.samples[0])
     assert all(sample.rollout_log_probs is None for sample in output.samples[0])
+    assert deleted == [f"/rollout-groups/{submitted_request['rollout_job_id']}"]
     assert output.metrics == {
         "rollout/ash/groups": 1,
         "rollout/ash/samples": 2,
@@ -145,6 +150,8 @@ def test_rollout_fn_requests_and_imports_rollout_log_probs_when_enabled():
                     "status": "queued",
                 },
             )
+        if request.method == "DELETE":
+            return httpx.Response(200, json=_deletion(submitted_request, status="completed"))
         return httpx.Response(200, json=_result(submitted_request, status="completed", with_trajectories=True))
 
     output, _data_source = _run_rollout(handler, use_rollout_logprobs=True)
@@ -168,6 +175,8 @@ def test_rollout_fn_forwards_chat_template_kwargs_to_ash():
                     "status": "queued",
                 },
             )
+        if request.method == "DELETE":
+            return httpx.Response(200, json=_deletion(submitted_request, status="completed"))
         return httpx.Response(200, json=_result(submitted_request, status="completed", with_trajectories=True))
 
     _run_rollout(handler, apply_chat_template_kwargs={"enable_thinking": False})
@@ -193,6 +202,8 @@ def test_rollout_fn_scores_only_trajectories_without_ash_reward(monkeypatch):
                     "status": "queued",
                 },
             )
+        if request.method == "DELETE":
+            return httpx.Response(200, json=_deletion(submitted_request, status="completed"))
         result = _result(submitted_request, status="completed", with_trajectories=True)
         result["trajectories"][0]["reward"] = None
         result["trajectories"][1]["reward"] = 0.75
@@ -228,7 +239,7 @@ def test_rollout_fn_rejects_missing_requested_rollout_log_probs():
                 },
             )
         if request.method == "DELETE":
-            return httpx.Response(200, json=_result(submitted_request, status="cancelled"))
+            return httpx.Response(200, json=_deletion(submitted_request, status="cancelled"))
         result = _result(submitted_request, status="completed", with_trajectories=True)
         for trajectory in result["trajectories"]:
             for span in trajectory["generated_spans"]:
@@ -257,13 +268,33 @@ def test_rollout_fn_cancels_remote_job_after_timeout():
             )
         if request.method == "DELETE":
             cancelled.append(request.url.path)
-            return httpx.Response(200, json=_result(submitted_request, status="cancelled"))
+            return httpx.Response(200, json=_deletion(submitted_request, status="cancelled"))
         return httpx.Response(200, json=_result(submitted_request, status="running"))
 
     with pytest.raises(TimeoutError):
         _run_rollout(handler, ash_rollout_timeout_seconds=0.01)
 
     assert cancelled == [f"/rollout-groups/{submitted_request['rollout_job_id']}"]
+
+
+def test_rollout_fn_deletes_job_when_submit_response_is_lost():
+    submitted_request = None
+    deleted = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal submitted_request
+        if request.method == "POST":
+            submitted_request = json.loads(request.content)
+            raise httpx.ReadError("response lost after server accepted job", request=request)
+        if request.method == "DELETE":
+            deleted.append(request.url.path)
+            return httpx.Response(200, json=_deletion(submitted_request, status="cancelled"))
+        raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
+
+    with pytest.raises(httpx.ReadError, match="response lost"):
+        _run_rollout(handler)
+
+    assert deleted == [f"/rollout-groups/{submitted_request['rollout_job_id']}"]
 
 
 def test_rollout_fn_reports_remote_failure_reason():
@@ -282,7 +313,7 @@ def test_rollout_fn_reports_remote_failure_reason():
                 },
             )
         if request.method == "DELETE":
-            return httpx.Response(200, json=_result(submitted_request, status="failed"))
+            return httpx.Response(200, json=_deletion(submitted_request, status="failed"))
         result = _result(submitted_request, status="failed")
         result["stop_reason"] = "RuntimeError: sandbox startup failed"
         return httpx.Response(200, json=result)
@@ -307,7 +338,7 @@ def test_rollout_fn_rejects_partial_group_until_training_supports_it():
                 },
             )
         if request.method == "DELETE":
-            return httpx.Response(200, json=_result(submitted_request, status="cancelled"))
+            return httpx.Response(200, json=_deletion(submitted_request, status="cancelled"))
         result = _result(submitted_request, status="early_stopped", with_trajectories=True)
         result["actual_samples"] = 1
         result["trajectories"] = result["trajectories"][:1]
@@ -333,7 +364,7 @@ def test_rollout_fn_rejects_a_different_weight_version():
                 },
             )
         if request.method == "DELETE":
-            return httpx.Response(200, json=_result(submitted_request, status="cancelled"))
+            return httpx.Response(200, json=_deletion(submitted_request, status="cancelled"))
         result = _result(submitted_request, status="completed", with_trajectories=True)
         result["trajectories"][0]["generated_spans"][0]["weight_version"] = "8"
         return httpx.Response(200, json=result)
@@ -358,7 +389,7 @@ def test_rollout_fn_rejects_a_different_job_id():
                 },
             )
         if request.method == "DELETE":
-            return httpx.Response(200, json=_result(submitted_request, status="cancelled"))
+            return httpx.Response(200, json=_deletion(submitted_request, status="cancelled"))
         result = _result(submitted_request, status="completed", with_trajectories=True)
         result["rollout_job_id"] = "another-job"
         return httpx.Response(200, json=result)
@@ -386,7 +417,7 @@ def test_rollout_fn_cancels_remote_job_when_local_task_is_cancelled():
             )
         if request.method == "DELETE":
             cancelled.append(request.url.path)
-            return httpx.Response(200, json=_result(submitted.request, status="cancelled"))
+            return httpx.Response(200, json=_deletion(submitted.request, status="cancelled"))
         return httpx.Response(200, json=_result(submitted.request, status="running"))
 
     async def exercise_cancellation():
@@ -512,4 +543,12 @@ def _result(request, *, status, with_trajectories=False):
         "search_branches": 3,
         "consumed_budget": {"model_calls": 2, "tool_calls": 1},
         "trajectories": trajectories,
+    }
+
+
+def _deletion(request, *, status):
+    return {
+        "protocol_version": "ash-rollout-v1",
+        "rollout_job_id": request["rollout_job_id"],
+        "status": status,
     }

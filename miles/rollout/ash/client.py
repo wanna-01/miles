@@ -4,7 +4,12 @@ from typing import Any
 
 import httpx
 
-from miles.rollout.ash.protocol import AshRolloutRequest, AshRolloutResult, AshRolloutSubmission
+from miles.rollout.ash.protocol import (
+    AshRolloutDeletion,
+    AshRolloutRequest,
+    AshRolloutResult,
+    AshRolloutSubmission,
+)
 
 _TERMINAL_JOB_STATUSES = {"completed", "early_stopped", "failed", "cancelled"}
 
@@ -54,10 +59,15 @@ class AshRolloutClient:
                 return result
             await asyncio.sleep(poll_interval_seconds)
 
-    async def cancel(self, rollout_job_id: str) -> AshRolloutResult:
+    async def delete(self, rollout_job_id: str) -> AshRolloutDeletion:
+        """Cancel unfinished work and release Ash's job record."""
         response = await self._client.delete(f"/rollout-groups/{rollout_job_id}")
         response.raise_for_status()
-        return AshRolloutResult.model_validate(response.json())
+        return AshRolloutDeletion.model_validate(response.json())
+
+    async def cancel(self, rollout_job_id: str) -> AshRolloutDeletion:
+        """Compatibility alias for the original client API."""
+        return await self.delete(rollout_job_id)
 
     async def close(self) -> None:
         if self._owns_client:

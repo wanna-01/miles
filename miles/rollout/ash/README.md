@@ -36,13 +36,17 @@ prompt group it:
 4. validates group identity, slot ownership, policy version, messages, and
    token boundaries;
 5. imports each returned trajectory into a Miles `Sample`; and
-6. cancels unfinished remote work with
-   `DELETE /rollout-groups/{rollout_job_id}` when local processing fails or
-   times out.
+6. sends `DELETE /rollout-groups/{rollout_job_id}` after consuming the result,
+   or when local processing fails or times out, so Ash can cancel unfinished
+   work and release the complete trajectory record.
 
 The service receives a model endpoint for ordinary generation. When a Miles
 Session Server endpoint is supplied, the service can use it for multi-turn
 generation with exact token and trajectory tracking.
+
+`ash-rollout-v1` is a strict contract on both sides: unknown fields are
+rejected instead of ignored. Any wire-format extension therefore requires a
+coordinated protocol update rather than a one-sided optional field.
 
 ## Trajectory contract
 
