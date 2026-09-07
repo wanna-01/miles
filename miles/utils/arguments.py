@@ -520,6 +520,60 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--ash-rollout-base-url",
+                type=str,
+                default=None,
+                help="Base URL of the Ash rollout service used by AshRolloutFn.",
+            )
+            parser.add_argument(
+                "--ash-rollout-model-endpoint",
+                type=str,
+                default=None,
+                help=(
+                    "Miles model endpoint passed to Ash. Defaults to the rollout router URL "
+                    "after the rollout service starts."
+                ),
+            )
+            parser.add_argument(
+                "--ash-rollout-session-server-endpoint",
+                type=str,
+                default=None,
+                help=(
+                    "Optional Miles v2 Session Server base URL passed to Ash. "
+                    "When omitted, AshRolloutFn derives the first configured session-server worker."
+                ),
+            )
+            parser.add_argument(
+                "--ash-rollout-poll-interval-seconds",
+                type=float,
+                default=0.5,
+                help="Interval between Ash rollout-job status requests.",
+            )
+            parser.add_argument(
+                "--ash-rollout-timeout-seconds",
+                type=float,
+                default=1800.0,
+                help="Maximum wall time for one Ash prompt-group rollout.",
+            )
+            parser.add_argument(
+                "--ash-rollout-http-timeout-seconds",
+                type=float,
+                default=30.0,
+                help="Timeout for an individual Miles-to-Ash HTTP request.",
+            )
+            parser.add_argument(
+                "--ash-rollout-max-model-calls",
+                type=int,
+                default=100,
+                help="Maximum model calls Ash may use for one prompt group.",
+            )
+            parser.add_argument(
+                "--ash-rollout-max-tool-calls",
+                type=int,
+                default=100,
+                help="Maximum tool calls Ash may use for one prompt group.",
+            )
+            parser.add_argument(
                 "--fully-async",
                 action="store_true",
                 default=False,
