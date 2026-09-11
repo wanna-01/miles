@@ -10,7 +10,7 @@ from miles.utils.types import Sample
 
 def _result_payload():
     return {
-        "protocol_version": "ash-rollout-v1",
+        "protocol_version": "ash-rollout-v2",
         "rollout_job_id": "job-1",
         "prompt_group_id": "group-3",
         "status": "early_stopped",

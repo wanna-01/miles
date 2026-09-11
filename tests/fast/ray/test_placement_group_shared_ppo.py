@@ -40,6 +40,33 @@ def test_external_rollout_only_reserves_no_local_bundles():
     assert _get_placement_group_layout(_layout_args(debug_rollout_only=True, rollout_external=True)) == (0, 0)
 
 
+def test_rollout_manager_inherits_train_environment(monkeypatch):
+    captured = {}
+
+    class _Remote:
+        def remote(self, *_args, **_kwargs):
+            return object()
+
+    class _RolloutManager:
+        @staticmethod
+        def options(**kwargs):
+            captured.update(kwargs)
+            return _Remote()
+
+    monkeypatch.setattr(placement_group_module, "RolloutManager", _RolloutManager)
+    args = Namespace(
+        train_env_vars={"PYTHONPATH": "/opt/custom-reward"},
+        pin_rollout_manager_to_head=False,
+        num_rollout=1,
+        check_weight_update_equal=False,
+        offload_rollout=False,
+    )
+
+    placement_group_module.create_rollout_manager(args, pg=object())
+
+    assert captured["runtime_env"] == {"env_vars": args.train_env_vars}
+
+
 async def test_critic_role_disables_reward_kl_and_preserves_actor_args(monkeypatch):
     groups = []
 

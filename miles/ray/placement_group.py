@@ -200,7 +200,10 @@ async def create_training_models(args, pgs, rollout_manager):
 
 def create_rollout_manager(args, pg):
     rollout_manager = RolloutManager.options(
-        num_cpus=1, num_gpus=0, **(compute_ray_pin_head_options() if args.pin_rollout_manager_to_head else {})
+        num_cpus=1,
+        num_gpus=0,
+        runtime_env={"env_vars": args.train_env_vars},
+        **(compute_ray_pin_head_options() if args.pin_rollout_manager_to_head else {}),
     ).remote(args, pg)
 
     # calculate num_rollout from num_epoch

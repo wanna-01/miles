@@ -6,7 +6,13 @@ from typing import Any
 
 from miles.rollout.ash.client import AshRolloutClient
 from miles.rollout.ash.importer import import_ash_rollout_result
-from miles.rollout.ash.protocol import AshRolloutBudget, AshRolloutRequest, AshRolloutResult, AshSampleSlot
+from miles.rollout.ash.protocol import (
+    AshEnvironmentRef,
+    AshRolloutBudget,
+    AshRolloutRequest,
+    AshRolloutResult,
+    AshSampleSlot,
+)
 from miles.rollout.base_types import (
     RolloutFnConstructorInput,
     RolloutFnEvalInput,
@@ -115,11 +121,13 @@ class AshRolloutFn:
                     f"expected {request.rollout_job_id!r}"
                 )
 
-            async with asyncio.timeout(self._rollout_timeout_seconds):
-                result = await client.wait_for_result(
+            result = await asyncio.wait_for(
+                client.wait_for_result(
                     request.rollout_job_id,
                     poll_interval_seconds=self._poll_interval_seconds,
-                )
+                ),
+                timeout=self._rollout_timeout_seconds,
+            )
             _validate_result_contract(request, result)
             samples = import_ash_rollout_result(result, slot_samples)
             samples_need_reward = [sample for sample in samples if sample.reward is None]
@@ -143,6 +151,7 @@ class AshRolloutFn:
                 f"expected n_samples_per_prompt={self._args.n_samples_per_prompt}"
             )
         prompt_group_id, prompt = _validate_group(group)
+        task_id, environment_ref = _task_environment(group)
         prompt_token_ids = self._prompt_token_ids(group)
         job_id = f"miles-{rollout_id}-{prompt_group_id}-{uuid.uuid4().hex}"
         slots = [
@@ -158,6 +167,8 @@ class AshRolloutFn:
             rollout_job_id=job_id,
             rollout_id=rollout_id,
             prompt_group_id=prompt_group_id,
+            task_id=task_id,
+            environment_ref=environment_ref,
             sample_slots=slots,
             max_samples=max_samples,
             prompt=prompt,
@@ -238,6 +249,27 @@ def _required_arg(args: Any, name: str) -> Any:
         option = name.replace("_", "-")
         raise ValueError(f"--{option} is required by AshRolloutFn")
     return value
+
+
+def _task_environment(group: list[Sample]) -> tuple[str, AshEnvironmentRef]:
+    """Read one immutable environment identity shared by the prompt group."""
+    resolved: list[tuple[str, AshEnvironmentRef]] = []
+    for sample in group:
+        metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+        task_id = metadata.get("task_id")
+        if not isinstance(task_id, str) or not task_id.strip():
+            raise ValueError("Ash rollout samples require metadata['task_id']")
+        raw_ref = metadata.get("environment_ref")
+        if not isinstance(raw_ref, dict):
+            raise ValueError("Ash rollout samples require metadata['environment_ref']")
+        resolved.append((task_id, AshEnvironmentRef.model_validate(raw_ref)))
+
+    first = resolved[0]
+    if any(item != first for item in resolved[1:]):
+        raise ValueError(
+            "all samples in an Ash prompt group must use the same task_id and environment_ref"
+        )
+    return first
 
 
 def _sampling_params(args: Any) -> dict[str, Any]:

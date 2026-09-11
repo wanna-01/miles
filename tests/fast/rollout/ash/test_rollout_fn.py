@@ -51,8 +51,23 @@ def _args(**overrides):
 
 
 def _group():
+    metadata = {
+        "task_id": "swebench__repo-123",
+        "environment_ref": {
+            "kind": "template",
+            "id": "swebench-runtime",
+            "revision": "sha256:test",
+            "resource_profile": "standard",
+        },
+    }
     return [
-        Sample(prompt=[{"role": "user", "content": "fix it"}], tokens=[10], group_index=3, index=index)
+        Sample(
+            prompt=[{"role": "user", "content": "fix it"}],
+            tokens=[10],
+            group_index=3,
+            index=index,
+            metadata=metadata,
+        )
         for index in (11, 12)
     ]
 
@@ -97,7 +112,7 @@ def test_rollout_fn_submits_group_polls_and_imports_samples():
             return httpx.Response(
                 202,
                 json={
-                    "protocol_version": "ash-rollout-v1",
+                    "protocol_version": "ash-rollout-v2",
                     "rollout_job_id": submitted_request["rollout_job_id"],
                     "status": "queued",
                 },
@@ -115,6 +130,13 @@ def test_rollout_fn_submits_group_polls_and_imports_samples():
 
     assert data_source.requests == [1]
     assert submitted_request["prompt_group_id"] == "3"
+    assert submitted_request["task_id"] == "swebench__repo-123"
+    assert submitted_request["environment_ref"] == {
+        "kind": "template",
+        "id": "swebench-runtime",
+        "revision": "sha256:test",
+        "resource_profile": "standard",
+    }
     assert submitted_request["max_samples"] == 2
     assert submitted_request["minimum_returned_samples"] == 2
     assert submitted_request["prompt_token_ids"] == [10]
@@ -145,7 +167,7 @@ def test_rollout_fn_requests_and_imports_rollout_log_probs_when_enabled():
             return httpx.Response(
                 202,
                 json={
-                    "protocol_version": "ash-rollout-v1",
+                    "protocol_version": "ash-rollout-v2",
                     "rollout_job_id": submitted_request["rollout_job_id"],
                     "status": "queued",
                 },
@@ -170,7 +192,7 @@ def test_rollout_fn_forwards_chat_template_kwargs_to_ash():
             return httpx.Response(
                 202,
                 json={
-                    "protocol_version": "ash-rollout-v1",
+                    "protocol_version": "ash-rollout-v2",
                     "rollout_job_id": submitted_request["rollout_job_id"],
                     "status": "queued",
                 },
@@ -197,7 +219,7 @@ def test_rollout_fn_scores_only_trajectories_without_ash_reward(monkeypatch):
             return httpx.Response(
                 202,
                 json={
-                    "protocol_version": "ash-rollout-v1",
+                    "protocol_version": "ash-rollout-v2",
                     "rollout_job_id": submitted_request["rollout_job_id"],
                     "status": "queued",
                 },
@@ -233,7 +255,7 @@ def test_rollout_fn_rejects_missing_requested_rollout_log_probs():
             return httpx.Response(
                 202,
                 json={
-                    "protocol_version": "ash-rollout-v1",
+                    "protocol_version": "ash-rollout-v2",
                     "rollout_job_id": submitted_request["rollout_job_id"],
                     "status": "queued",
                 },
@@ -261,7 +283,7 @@ def test_rollout_fn_cancels_remote_job_after_timeout():
             return httpx.Response(
                 202,
                 json={
-                    "protocol_version": "ash-rollout-v1",
+                    "protocol_version": "ash-rollout-v2",
                     "rollout_job_id": submitted_request["rollout_job_id"],
                     "status": "running",
                 },
@@ -307,7 +329,7 @@ def test_rollout_fn_reports_remote_failure_reason():
             return httpx.Response(
                 202,
                 json={
-                    "protocol_version": "ash-rollout-v1",
+                    "protocol_version": "ash-rollout-v2",
                     "rollout_job_id": submitted_request["rollout_job_id"],
                     "status": "queued",
                 },
@@ -332,7 +354,7 @@ def test_rollout_fn_rejects_partial_group_until_training_supports_it():
             return httpx.Response(
                 202,
                 json={
-                    "protocol_version": "ash-rollout-v1",
+                    "protocol_version": "ash-rollout-v2",
                     "rollout_job_id": submitted_request["rollout_job_id"],
                     "status": "queued",
                 },
@@ -358,7 +380,7 @@ def test_rollout_fn_rejects_a_different_weight_version():
             return httpx.Response(
                 202,
                 json={
-                    "protocol_version": "ash-rollout-v1",
+                    "protocol_version": "ash-rollout-v2",
                     "rollout_job_id": submitted_request["rollout_job_id"],
                     "status": "queued",
                 },
@@ -383,7 +405,7 @@ def test_rollout_fn_rejects_a_different_job_id():
             return httpx.Response(
                 202,
                 json={
-                    "protocol_version": "ash-rollout-v1",
+                    "protocol_version": "ash-rollout-v2",
                     "rollout_job_id": submitted_request["rollout_job_id"],
                     "status": "queued",
                 },
@@ -410,7 +432,7 @@ def test_rollout_fn_cancels_remote_job_when_local_task_is_cancelled():
             return httpx.Response(
                 202,
                 json={
-                    "protocol_version": "ash-rollout-v1",
+                    "protocol_version": "ash-rollout-v2",
                     "rollout_job_id": payload["rollout_job_id"],
                     "status": "running",
                 },
@@ -461,6 +483,30 @@ def test_rollout_fn_rejects_mismatched_prompt_token_ids():
         fn._build_request(group=group, rollout_id=4, weight_version=7)
 
 
+def test_rollout_fn_requires_trusted_environment_metadata():
+    group = _group()
+    group[0].metadata = {}
+    fn = AshRolloutFn(RolloutFnConstructorInput(args=_args(), data_source=FakeDataSource([group])))
+
+    with pytest.raises(ValueError, match=r"metadata\['task_id'\]"):
+        fn._build_request(group=group, rollout_id=4, weight_version=7)
+
+
+def test_rollout_fn_rejects_group_environment_mismatch():
+    group = _group()
+    group[1].metadata = {
+        **group[1].metadata,
+        "environment_ref": {
+            **group[1].metadata["environment_ref"],
+            "revision": "sha256:other",
+        },
+    }
+    fn = AshRolloutFn(RolloutFnConstructorInput(args=_args(), data_source=FakeDataSource([group])))
+
+    with pytest.raises(ValueError, match="same task_id and environment_ref"):
+        fn._build_request(group=group, rollout_id=4, weight_version=7)
+
+
 def test_rollout_fn_tokenizes_prompt_when_data_source_has_no_tokens(monkeypatch):
     class FakeTokenizer:
         def encode(self, text, *, add_special_tokens):
@@ -469,7 +515,15 @@ def test_rollout_fn_tokenizes_prompt_when_data_source_has_no_tokens(monkeypatch)
             return [31, 32]
 
     monkeypatch.setattr("miles.rollout.ash.rollout_fn.load_tokenizer", lambda *_args, **_kwargs: FakeTokenizer())
-    group = [Sample(prompt="rendered prompt", group_index=3, index=index) for index in (11, 12)]
+    group = [
+        Sample(
+            prompt="rendered prompt",
+            group_index=3,
+            index=index,
+            metadata=_group()[0].metadata,
+        )
+        for index in (11, 12)
+    ]
     fn = AshRolloutFn(RolloutFnConstructorInput(args=_args(), data_source=FakeDataSource([group])))
 
     request, _slot_samples = fn._build_request(group=group, rollout_id=4, weight_version=7)
@@ -534,7 +588,7 @@ def _result(request, *, status, with_trajectories=False):
             for position, slot in enumerate(request["sample_slots"])
         ]
     return {
-        "protocol_version": "ash-rollout-v1",
+        "protocol_version": "ash-rollout-v2",
         "rollout_job_id": request["rollout_job_id"],
         "prompt_group_id": request["prompt_group_id"],
         "status": status,
@@ -548,7 +602,7 @@ def _result(request, *, status, with_trajectories=False):
 
 def _deletion(request, *, status):
     return {
-        "protocol_version": "ash-rollout-v1",
+        "protocol_version": "ash-rollout-v2",
         "rollout_job_id": request["rollout_job_id"],
         "status": status,
     }

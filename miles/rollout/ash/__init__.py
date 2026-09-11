@@ -2,6 +2,8 @@ from miles.rollout.ash.client import AshRolloutClient
 from miles.rollout.ash.importer import import_ash_rollout_result
 from miles.rollout.ash.protocol import (
     ASH_ROLLOUT_PROTOCOL_VERSION,
+    AshEnvironmentList,
+    AshEnvironmentRef,
     AshRolloutDeletion,
     AshGeneratedSpan,
     AshRolloutBudget,
@@ -14,6 +16,8 @@ from miles.rollout.ash.protocol import (
 
 __all__ = [
     "ASH_ROLLOUT_PROTOCOL_VERSION",
+    "AshEnvironmentList",
+    "AshEnvironmentRef",
     "AshRolloutDeletion",
     "AshGeneratedSpan",
     "AshRolloutBudget",

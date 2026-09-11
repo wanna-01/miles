@@ -5,6 +5,7 @@ from typing import Any
 import httpx
 
 from miles.rollout.ash.protocol import (
+    AshEnvironmentList,
     AshRolloutDeletion,
     AshRolloutRequest,
     AshRolloutResult,
@@ -29,6 +30,12 @@ class AshRolloutClient:
             timeout=httpx.Timeout(timeout),
             headers=headers,
         )
+
+    async def list_environments(self) -> AshEnvironmentList:
+        """List static environment identities approved by this Ash deployment."""
+        response = await self._client.get("/rollout-environments")
+        response.raise_for_status()
+        return AshEnvironmentList.model_validate(response.json())
 
     async def submit(self, request: AshRolloutRequest) -> AshRolloutSubmission:
         response = await self._client.post("/rollout-groups", json=request.model_dump(mode="json"))
