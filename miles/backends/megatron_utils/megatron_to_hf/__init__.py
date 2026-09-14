@@ -13,6 +13,15 @@ from .qwen3_next import convert_qwen3_next_to_hf
 from .qwen3moe import convert_qwen3moe_to_hf
 
 
+def _is_qwen3_5_family(model_name):
+    """Return whether *model_name* uses the shared Qwen3.5+ architecture."""
+    return any(
+        variant in model_name
+        for version in ("5", "6", "8")
+        for variant in (f"qwen3_{version}", f"qwen3.{version}")
+    )
+
+
 # TODO unify w/ `convert_to_hf`
 def postprocess_hf_param(args, megatron_param_name, hf_param_name, param):
     param = remove_padding(megatron_param_name, param, args.vocab_size)
@@ -47,7 +56,7 @@ def _convert_to_hf_core(args, model_name, name, param):
         converted_named_tensors = convert_qwen3moe_to_hf(args, name, param)
     elif "qwen3next" in model_name:
         converted_named_tensors = convert_qwen3_next_to_hf(args, name, param)
-    elif "qwen3_5" in model_name or "qwen3_6" in model_name:
+    elif _is_qwen3_5_family(model_name):
         converted_named_tensors = convert_qwen3_5_to_hf(args, name, param)
     elif "qwen2" in model_name or "qwen3" in model_name:
         converted_named_tensors = convert_qwen2_to_hf(args, name, param)

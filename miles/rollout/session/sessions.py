@@ -4,6 +4,7 @@ Thin layer: converts each HTTP request to primitive inputs, calls
 ``SessionCore``. All session/TITO logic lives in ``core``.
 """
 
+import asyncio
 import json
 import logging
 
@@ -27,6 +28,8 @@ from miles.rollout.session.anthropic_adapter import (
     _anthropic_wire_json,
     _parse_anthropic_request,
     _restore_anthropic_reasoning_history,
+    _strip_claude_code_token_budget_messages,
+    _strip_anthropic_output_config,
     _strip_anthropic_reasoning_history,
 )
 from miles.rollout.session.anthropic_adapter import (
@@ -110,13 +113,18 @@ def setup_session_routes(app, backend, args, *, use_addition_r3: bool = False):
     @app.post("/sessions/{session_id}/v1/chat/completions")
     async def chat_completions(request: Request, session_id: str):
         body = await request.body()
-        return await core.chat_completions(
-            session_id,
-            method=request.method,
-            query=request.url.query,
-            headers=dict(request.headers),
-            body=body,
-        )
+        try:
+            return await core.chat_completions(
+                session_id,
+                method=request.method,
+                query=request.url.query,
+                headers=dict(request.headers),
+                body=body,
+            )
+        except asyncio.CancelledError:
+            # Session deletion deliberately cancels the proxy task. Return a
+            # stable non-standard 499 instead of surfacing an ASGI traceback.
+            return Response(status_code=499)
 
     # Keep before session_proxy: Starlette's first match must not bypass session/TITO.
     @app.post("/sessions/{session_id}/v1/messages")
@@ -127,10 +135,18 @@ def setup_session_routes(app, backend, args, *, use_addition_r3: bool = False):
             anthropic_request = _parse_anthropic_request(body)
             _validate_anthropic_features(anthropic_request)
             try:
+                anthropic_request = _strip_claude_code_token_budget_messages(
+                    anthropic_request
+                )
                 conversion_request, reasoning_history = _strip_anthropic_reasoning_history(anthropic_request)
+                conversion_request, reasoning_effort = _strip_anthropic_output_config(
+                    conversion_request
+                )
                 openai_request = convert_to_chat_completion_request(
                     conversion_request, merge_inline_system=merge_inline_system
                 )
+                if reasoning_effort is not None:
+                    openai_request.reasoning_effort = reasoning_effort
             except Exception as exc:
                 logger.exception("Error converting Anthropic request: %s", exc)
                 raise ValueError(str(exc)) from exc

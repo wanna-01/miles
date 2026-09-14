@@ -13,6 +13,7 @@ StrictNumber = StrictFloat | StrictInt
 
 AshJobStatus = Literal["queued", "running", "completed", "early_stopped", "failed", "cancelled"]
 AshTrajectoryStatus = Literal["completed", "truncated", "failed", "aborted"]
+AshPromptTokenAlignment = Literal["request_exact", "harness_rendered"]
 
 
 class AshSampleSlot(FrozenStrictBaseModel):
@@ -21,8 +22,8 @@ class AshSampleSlot(FrozenStrictBaseModel):
 
 
 class AshRolloutBudget(FrozenStrictBaseModel):
-    max_model_calls: StrictInt = Field(gt=0)
-    max_tool_calls: StrictInt = Field(ge=0)
+    max_model_calls: StrictInt | None = Field(gt=0)
+    max_tool_calls: StrictInt | None = Field(ge=0)
     max_wall_time_seconds: StrictFloat = Field(gt=0)
 
     @model_validator(mode="after")
@@ -127,6 +128,7 @@ class AshTrajectory(FrozenStrictBaseModel):
     response_text: str
     reward: StrictNumber | dict[str, Any] | None = None
     status: AshTrajectoryStatus
+    prompt_token_alignment: AshPromptTokenAlignment = "request_exact"
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -153,6 +155,31 @@ class AshRolloutDeletion(FrozenStrictBaseModel):
     status: Literal["completed", "early_stopped", "failed", "cancelled"]
 
 
+class AshRolloutProgress(FrozenStrictBaseModel):
+    """Operational progress exposed while an Ash rollout is queued or running."""
+
+    phase: NonEmptyStr
+    model_calls: StrictInt = Field(default=0, ge=0)
+    tool_calls: StrictInt = Field(default=0, ge=0)
+    completed_samples: StrictInt = Field(default=0, ge=0)
+    active_sample_slot_id: NonEmptyStr | None = None
+    elapsed_seconds: StrictNumber = Field(default=0, ge=0)
+    remaining_wall_time_seconds: StrictNumber | None = Field(default=None, ge=0)
+    updated_at_unix_seconds: StrictNumber = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def validate_finite_times(self) -> "AshRolloutProgress":
+        for name in (
+            "elapsed_seconds",
+            "remaining_wall_time_seconds",
+            "updated_at_unix_seconds",
+        ):
+            value = getattr(self, name)
+            if value is not None and not math.isfinite(value):
+                raise ValueError(f"{name} must be finite")
+        return self
+
+
 class AshRolloutResult(FrozenStrictBaseModel):
     protocol_version: Literal[ASH_ROLLOUT_PROTOCOL_VERSION] = ASH_ROLLOUT_PROTOCOL_VERSION
     rollout_job_id: NonEmptyStr
@@ -163,6 +190,7 @@ class AshRolloutResult(FrozenStrictBaseModel):
     stop_reason: str | None = None
     search_branches: StrictInt = Field(default=0, ge=0)
     consumed_budget: dict[str, StrictNumber] = Field(default_factory=dict)
+    progress: AshRolloutProgress | None = None
     trajectories: list[AshTrajectory] = Field(default_factory=list)
 
     @model_validator(mode="after")

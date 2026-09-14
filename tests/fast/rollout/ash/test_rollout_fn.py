@@ -38,6 +38,7 @@ def _args(**overrides):
         "ash_rollout_model_endpoint": None,
         "ash_rollout_poll_interval_seconds": 0.001,
         "ash_rollout_timeout_seconds": 1.0,
+        "ash_rollout_client_grace_seconds": 0.1,
         "ash_rollout_http_timeout_seconds": 2.0,
         "ash_rollout_max_model_calls": 12,
         "ash_rollout_max_tool_calls": 8,
@@ -529,6 +530,59 @@ def test_rollout_fn_tokenizes_prompt_when_data_source_has_no_tokens(monkeypatch)
     request, _slot_samples = fn._build_request(group=group, rollout_id=4, weight_version=7)
 
     assert request.prompt_token_ids == [31, 32]
+
+
+def test_rollout_fn_tokenizes_text_messages_with_empty_multimodal_placeholders(monkeypatch):
+    class FakeTokenizer:
+        pass
+
+    def fake_apply_chat_template(
+        messages,
+        *,
+        tokenizer,
+        tools,
+        tokenize,
+        add_generation_prompt,
+        enable_thinking,
+    ):
+        assert messages == [{"role": "user", "content": "fix it"}]
+        assert isinstance(tokenizer, FakeTokenizer)
+        assert tools is None
+        assert tokenize is True
+        assert add_generation_prompt is True
+        assert enable_thinking is False
+        return [41, 42]
+
+    monkeypatch.setattr("miles.rollout.ash.rollout_fn.load_tokenizer", lambda *_args, **_kwargs: FakeTokenizer())
+    monkeypatch.setattr(
+        "miles.rollout.ash.rollout_fn.chat_template_utils.apply_chat_template",
+        fake_apply_chat_template,
+    )
+    group = _group()
+    for sample in group:
+        sample.tokens = []
+        sample.multimodal_inputs = {"images": None, "videos": None}
+    fn = AshRolloutFn(
+        RolloutFnConstructorInput(
+            args=_args(apply_chat_template_kwargs={"enable_thinking": False}),
+            data_source=FakeDataSource([group]),
+        )
+    )
+
+    request, _slot_samples = fn._build_request(group=group, rollout_id=4, weight_version=7)
+
+    assert request.prompt_token_ids == [41, 42]
+
+
+def test_rollout_fn_rejects_actual_multimodal_prompt_without_tokens():
+    group = _group()
+    for sample in group:
+        sample.tokens = []
+        sample.multimodal_inputs = {"images": [object()], "videos": None}
+    fn = AshRolloutFn(RolloutFnConstructorInput(args=_args(), data_source=FakeDataSource([group])))
+
+    with pytest.raises(NotImplementedError, match="multimodal"):
+        fn._build_request(group=group, rollout_id=4, weight_version=7)
 
 
 def test_rollout_fn_resolves_model_endpoint_after_router_startup():

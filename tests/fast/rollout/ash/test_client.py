@@ -9,6 +9,7 @@ from miles.rollout.ash.protocol import (
     AshEnvironmentRef,
     AshGeneratedSpan,
     AshRolloutBudget,
+    AshRolloutProgress,
     AshRolloutRequest,
     AshRolloutResult,
     AshSampleSlot,
@@ -76,6 +77,33 @@ def test_budget_rejects_non_finite_or_boolean_wall_time(value):
         )
 
 
+def test_budget_accepts_unbounded_call_limits():
+    budget = AshRolloutBudget(
+        max_model_calls=None,
+        max_tool_calls=None,
+        max_wall_time_seconds=60,
+    )
+
+    assert budget.model_dump(mode="json") == {
+        "max_model_calls": None,
+        "max_tool_calls": None,
+        "max_wall_time_seconds": 60.0,
+    }
+
+
+@pytest.mark.parametrize("field", ["max_model_calls", "max_tool_calls"])
+def test_budget_requires_explicit_call_limit_fields(field):
+    payload = {
+        "max_model_calls": None,
+        "max_tool_calls": None,
+        "max_wall_time_seconds": 60.0,
+    }
+    del payload[field]
+
+    with pytest.raises(ValidationError):
+        AshRolloutBudget.model_validate(payload)
+
+
 @pytest.mark.parametrize("value", [True, -1, float("inf"), float("nan")])
 def test_result_rejects_invalid_consumed_budget(value):
     with pytest.raises(ValidationError):
@@ -87,6 +115,35 @@ def test_result_rejects_invalid_consumed_budget(value):
             actual_samples=0,
             consumed_budget={"model_calls": value},
         )
+
+
+def test_result_accepts_running_progress():
+    result = AshRolloutResult(
+        rollout_job_id="job-1",
+        prompt_group_id="group-3",
+        status="running",
+        max_samples=1,
+        actual_samples=0,
+        progress=AshRolloutProgress(
+            phase="model_generation",
+            model_calls=4,
+            tool_calls=3,
+            active_sample_slot_id="slot-11",
+            elapsed_seconds=12.5,
+            remaining_wall_time_seconds=47.5,
+            updated_at_unix_seconds=1_800_000_000.0,
+        ),
+    )
+
+    assert result.progress is not None
+    assert result.progress.phase == "model_generation"
+    assert result.progress.model_calls == 4
+
+
+@pytest.mark.parametrize("value", [-1, float("inf"), float("nan")])
+def test_progress_rejects_invalid_elapsed_time(value):
+    with pytest.raises(ValidationError):
+        AshRolloutProgress(phase="model_generation", elapsed_seconds=value)
 
 
 @pytest.mark.parametrize("value", [True, float("inf"), float("nan")])
@@ -184,6 +241,16 @@ def test_client_submit_get_and_delete():
                 "status": status,
                 "max_samples": 1,
                 "actual_samples": 0,
+                "progress": {
+                    "phase": "model_generation",
+                    "model_calls": 4,
+                    "tool_calls": 3,
+                    "completed_samples": 0,
+                    "active_sample_slot_id": "slot-11",
+                    "elapsed_seconds": 12.5,
+                    "remaining_wall_time_seconds": 47.5,
+                    "updated_at_unix_seconds": 1800000000.0,
+                },
                 "trajectories": [],
             },
         )
@@ -203,6 +270,8 @@ def test_client_submit_get_and_delete():
 
     assert submission.status == "queued"
     assert running.status == "running"
+    assert running.progress is not None
+    assert running.progress.model_calls == 4
     assert deleted.status == "cancelled"
     assert methods == [
         ("POST", "/rollout-groups"),

@@ -112,6 +112,34 @@ def test_imports_trajectory_without_rollout_log_probs():
     assert sample.weight_versions == ["7", "7"]
 
 
+def test_imports_harness_rendered_prompt_and_preserves_requested_prompt_tokens():
+    payload = _result_payload()
+    trajectory = payload["trajectories"][0]
+    trajectory["prompt_token_alignment"] = "harness_rendered"
+    trajectory["token_ids"][:2] = [100, 101]
+    for span in trajectory["generated_spans"]:
+        span["input_token_ids"][:2] = [100, 101]
+    result = AshRolloutResult.model_validate(payload)
+
+    (sample,) = import_ash_rollout_result(result, _slot_samples())
+
+    assert sample.tokens[:2] == [100, 101]
+    assert sample.metadata["ash_rollout"]["prompt_token_alignment"] == "harness_rendered"
+    assert sample.metadata["ash_rollout"]["request_prompt_token_ids"] == [10, 11]
+
+
+def test_request_exact_prompt_still_rejects_a_token_mismatch():
+    payload = _result_payload()
+    trajectory = payload["trajectories"][0]
+    trajectory["token_ids"][:2] = [100, 101]
+    for span in trajectory["generated_spans"]:
+        span["input_token_ids"][:2] = [100, 101]
+    result = AshRolloutResult.model_validate(payload)
+
+    with pytest.raises(ValueError, match="prompt tokens do not match"):
+        import_ash_rollout_result(result, _slot_samples())
+
+
 def test_rejects_mixed_rollout_log_prob_presence():
     payload = _result_payload()
     payload["trajectories"][0]["generated_spans"][1].pop("output_token_log_probs")

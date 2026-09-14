@@ -8,10 +8,9 @@ Contract under test (with split-lock / session.closing):
   (expected_num_assistant check) ensures only one concurrent writer wins.
 - Different sessions can run in parallel (no global lock).
 - Per-session clients can run turn-by-turn without idle gaps while global load stays parallel.
-- Delete marks session.closing=True, acquires session.lock, then removes.
-  Because the lock is not held during Phase 2, delete can proceed while a
-  chat request is mid-proxy; the chat's Phase 3 will see closing=True and
-  skip the state update gracefully.
+- Delete marks session.closing=True, acquires session.lock, then cancels
+  in-flight proxy tasks and removes the session. Cancelling the proxy closes
+  the upstream HTTP request so the inference server can abort generation.
 - Chat requests to a closing session get 404 immediately (pre-lock check).
 - Chat requests arriving while delete waits for lock get 404 (double-check after lock).
 - Concurrent deletes on the same session: second delete gets 404.
@@ -193,11 +192,7 @@ class TestSessionConcurrencyContracts:
             assert env.backend.max_concurrent >= 4
 
     def test_delete_can_proceed_while_chat_is_mid_proxy(self):
-        """With split-lock, delete can acquire the lock while chat is in Phase 2.
-
-        The inflight chat's Phase 3 sees session.closing=True and skips
-        state update gracefully.  Both chat and delete complete without error.
-        """
+        """Deleting a session cancels a chat that is in proxy Phase 2."""
 
         def process_fn(prompt: str) -> ProcessResult:
             return ProcessResult(text="slow-turn", finish_reason="stop")
@@ -219,10 +214,13 @@ class TestSessionConcurrencyContracts:
                     raise AssertionError("in-flight request did not reach backend in time")
 
                 delete_resp = requests.delete(f"{env.url}/sessions/{session_id}", timeout=30.0)
-                inflight_resp = inflight.result(timeout=30.0)
+                try:
+                    inflight_resp = inflight.result(timeout=30.0)
+                except requests.RequestException:
+                    inflight_resp = None
 
-            # Chat returns 200 (backend responded); delete returns 204.
-            assert inflight_resp.status_code == 200
+            assert inflight_resp is not None
+            assert inflight_resp.status_code == 499
             assert delete_resp.status_code == 204
             # Session is gone after delete.
             post_delete = _chat(env.url, session_id, payload, timeout=10.0)
@@ -239,7 +237,7 @@ class TestClosingRaceConditions:
         1. Chat A starts, acquires lock (Phase 1), releases it, proxying (Phase 2)
         2. Delete arrives, sets session.closing=True, acquires lock, removes session
         3. Chat B arrives, sees session.closing=True, returns 404 immediately
-        4. Chat A's Phase 3 sees closing=True, skips state update, returns 200
+        4. Chat A's proxy task is cancelled and cannot commit state
         """
 
         def process_fn(prompt: str) -> ProcessResult:
@@ -274,10 +272,14 @@ class TestClosingRaceConditions:
                 assert chat_b.status_code == 404, f"Chat during closing should return 404, got {chat_b.status_code}"
 
                 # Wait for remaining futures
-                chat_a_resp = chat_a.result(timeout=30.0)
+                try:
+                    chat_a_resp = chat_a.result(timeout=30.0)
+                except requests.RequestException:
+                    chat_a_resp = None
                 delete_resp = delete_future.result(timeout=30.0)
 
-            assert chat_a_resp.status_code == 200
+            assert chat_a_resp is not None
+            assert chat_a_resp.status_code == 499
             assert delete_resp.status_code == 204
 
     def test_double_delete_second_returns_404(self):
@@ -322,7 +324,7 @@ class TestClosingRaceConditions:
                 d1 = delete_1.result(timeout=30.0)
                 d2 = delete_2.result(timeout=30.0)
 
-            assert chat_resp.status_code == 200
+            assert chat_resp.status_code == 499
             # One delete succeeds, the other gets 404
             codes = sorted([d1.status_code, d2.status_code])
             assert codes == [204, 404], f"Expected [204, 404], got {codes}"
@@ -386,12 +388,11 @@ class TestClosingRaceConditions:
 
             assert delete_resp.status_code == 204
 
-            # At least one chat must succeed (the one holding the lock when
-            # delete arrived).  Others may get 200 (acquired lock before
-            # closing) or 404 (saw closing=True).  No 500s allowed.
+            # Requests already proxying are cancelled with 499; requests that
+            # observe closing before registration return 404.
             status_codes = [r.status_code for r in results]
-            assert all(c in (200, 404) for c in status_codes), f"Unexpected status codes: {status_codes}"
-            assert 200 in status_codes, f"Expected at least one 200, got {status_codes}"
+            assert all(c in (404, 499) for c in status_codes), f"Unexpected status codes: {status_codes}"
+            assert 499 in status_codes, f"Expected at least one cancelled request, got {status_codes}"
 
     def test_rapid_create_chat_delete_cycles(self):
         """Rapidly create, chat, and delete sessions to stress the lifecycle.

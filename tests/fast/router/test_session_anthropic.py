@@ -145,6 +145,10 @@ class TestAnthropicRoute:
         assert body["id"] == record["response"]["id"]
         if anthropic_env.version == "v2":
             assert body["id"] == snapshot["metadata"]["tree"]["nodes"][0]["response_id"]
+            assert snapshot["metadata"]["tree_records"]["0"]["record"] == record
+            assert snapshot["metadata"]["tree_records"]["0"]["token_ids"] == snapshot["metadata"][
+                "accumulated_token_ids"
+            ]
         assert record["path"] == "/v1/chat/completions"
         assert record["request"]["messages"] == [
             {"role": "system", "content": "sys"},
@@ -153,6 +157,75 @@ class TestAnthropicRoute:
         assert isinstance(record["request"]["input_ids"], list) and record["request"]["input_ids"]
         assert record["response"]["object"] == "chat.completion"
 
+    def test_claude_code_effort_reaches_openai_request(self, anthropic_env):
+        session_id = _create_session(anthropic_env.url)
+
+        response = _post_messages(
+            anthropic_env.url,
+            session_id,
+            _payload(
+                [{"role": "user", "content": "hello"}],
+                output_config={"effort": "xhigh"},
+            ),
+        )
+
+        assert response.status_code == 200
+        assert anthropic_env.backend.request_log[-1]["reasoning_effort"] == "max"
+
+    def test_error_tool_result_is_preserved_as_tool_output(self, anthropic_env):
+        session_id = _create_session(anthropic_env.url)
+        response = _post_messages(
+            anthropic_env.url,
+            session_id,
+            _payload(
+                [
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "tool-error",
+                                "name": "shell",
+                                "input": {"command": "false"},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "tool-error",
+                                "content": "command failed",
+                                "is_error": True,
+                            }
+                        ],
+                    },
+                ]
+            ),
+        )
+
+        assert response.status_code == 200
+        assert anthropic_env.backend.request_log[-1]["messages"] == [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "tool-error",
+                        "type": "function",
+                        "function": {
+                            "name": "shell",
+                            "arguments": '{"command": "false"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "tool-error",
+                "content": "command failed",
+            },
+        ]
     def test_assistant_thinking_history_becomes_canonical_reasoning_content(self, anthropic_env):
         session_id = _create_session(anthropic_env.url)
         resp = _post_messages(
@@ -245,6 +318,82 @@ class TestAnthropicRoute:
         replayed = records[1]["request"]["messages"][1]
         assert strict_message_matches(stored, replayed)
         assert replayed["reasoning_content"] == "ponder\n"
+
+    def test_claude_code_token_budget_messages_do_not_rewrite_session_prefix(
+        self, anthropic_env
+    ):
+        sdk_system = [
+            {
+                "type": "text",
+                "text": "x-anthropic-billing-header: cc_version=test; cc_entrypoint=sdk-py;",
+            },
+            {
+                "type": "text",
+                "text": "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+            },
+        ]
+        session_id = _create_session(anthropic_env.url)
+        first = _post_messages(
+            anthropic_env.url,
+            session_id,
+            _payload(
+                [
+                    {"role": "user", "content": "first"},
+                    {
+                        "role": "system",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "<total_tokens>15000000 tokens left</total_tokens>",
+                                "cache_control": {"type": "ephemeral"},
+                            }
+                        ],
+                    },
+                ],
+                system=sdk_system,
+            ),
+        )
+        assert first.status_code == 200
+
+        second = _post_messages(
+            anthropic_env.url,
+            session_id,
+            _payload(
+                [
+                    {"role": "user", "content": "first"},
+                    {
+                        "role": "system",
+                        "content": "<total_tokens>15000000 tokens left</total_tokens>",
+                    },
+                    {"role": "assistant", "content": first.json()["content"]},
+                    {"role": "user", "content": "again"},
+                    {
+                        "role": "system",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "<total_tokens>14999000 tokens left</total_tokens>",
+                                "cache_control": {"type": "ephemeral"},
+                            }
+                        ],
+                    },
+                ],
+                system=sdk_system,
+            ),
+        )
+        assert second.status_code == 200
+
+        snapshot = requests.get(
+            f"{anthropic_env.url}/sessions/{session_id}", timeout=5.0
+        ).json()
+        first_record, second_record = snapshot["records"]
+        assert "<total_tokens>" not in json.dumps(first_record["request"]["messages"])
+        assert "<total_tokens>" not in json.dumps(second_record["request"]["messages"])
+        if anthropic_env.version == "v2":
+            assert [node["parent"] for node in snapshot["metadata"]["tree"]["nodes"]] == [
+                None,
+                0,
+            ]
 
     def test_intermediate_system_stays_in_place(self, anthropic_env):
         leading_system = "initial policy"
@@ -490,8 +639,8 @@ class TestAnthropicRoute:
                 "thinking is not supported by this endpoint",
             ),
             (
-                _payload(messages, output_config={"effort": "high"}),
-                "output_config is not enabled for this deployment",
+                _payload(messages, output_config={"task_budget": {"type": "tokens", "total": 1024}}),
+                "output_config.task_budget is not supported by this endpoint",
             ),
             (_payload(messages, betas=["b-1"]), "betas is not enabled for this deployment"),
             (
@@ -554,24 +703,6 @@ class TestAnthropicRoute:
             (
                 _payload([{"role": "user", "content": [{"type": "search_result", "title": "t"}]}]),
                 "search_result content blocks are not enabled for this deployment",
-            ),
-            (
-                _payload(
-                    [
-                        {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "tool_result",
-                                    "tool_use_id": "t",
-                                    "content": "failed",
-                                    "is_error": True,
-                                }
-                            ],
-                        }
-                    ]
-                ),
-                "tool_result is_error=true is not supported by this endpoint",
             ),
             (
                 _payload(
@@ -657,12 +788,12 @@ class TestAnthropicRoute:
             (
                 _payload(
                     messages,
-                    output_config={"effort": "high"},
+                    output_config={"task_budget": {"type": "tokens", "total": 1024}},
                     betas=["b-1"],
                     tools=[{"type": "web_search_20250305", "name": "web_search"}],
                     system=[{"type": "image", "source": {"url": "https://x"}}],
                 ),
-                "output_config is not enabled for this deployment",
+                "output_config.task_budget is not supported by this endpoint",
             ),
             (
                 _payload(

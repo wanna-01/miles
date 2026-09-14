@@ -49,7 +49,11 @@ def _import_trajectory(
 
     loss_mask, rollout_log_probs, weight_versions = _build_token_metadata(trajectory)
     prompt_tokens = trajectory.token_ids[: trajectory.prompt_length]
-    if input_sample.tokens and input_sample.tokens != prompt_tokens:
+    if (
+        trajectory.prompt_token_alignment == "request_exact"
+        and input_sample.tokens
+        and input_sample.tokens != prompt_tokens
+    ):
         raise ValueError(
             f"Ash prompt tokens do not match Miles sample {trajectory.sample_slot_id!r}: "
             f"expected {input_sample.tokens}, got {prompt_tokens}"
@@ -73,6 +77,8 @@ def _import_trajectory(
         "branch_id": trajectory.branch_id,
         "parent_branch_id": trajectory.parent_branch_id,
         "branch_point_token_count": trajectory.branch_point_token_count,
+        "prompt_token_alignment": trajectory.prompt_token_alignment,
+        "request_prompt_token_ids": list(input_sample.tokens),
         "messages": deepcopy(trajectory.messages),
         "trajectory_metadata": deepcopy(trajectory.metadata),
         "stop_reason": result.stop_reason,

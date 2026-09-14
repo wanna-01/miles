@@ -267,6 +267,24 @@ def test_loose_tool_call_does_not_relax_reasoning_content() -> None:
     assert role_content_only_message_matches(stored, replayed)
 
 
+@pytest.mark.parametrize("whitespace", [" ", "\n\n", "\t\n"])
+def test_loose_tool_call_normalizes_whitespace_only_assistant_tool_content(
+    whitespace: str,
+) -> None:
+    stored = _assistant('{"x":1}', content=whitespace)
+    replayed = _assistant({"x": 1}, content=None)
+
+    assert not strict_message_matches(stored, replayed)
+    assert loose_tool_call_message_matches(stored, replayed)
+
+
+def test_loose_tool_call_keeps_whitespace_significant_without_tool_calls() -> None:
+    stored = {"role": "assistant", "content": "\n\n"}
+    replayed = {"role": "assistant", "content": None}
+
+    assert not loose_tool_call_message_matches(stored, replayed)
+
+
 def _projected_message(field: str, value: Any) -> dict[str, Any]:
     message: dict[str, Any] = {"role": "user", "content": "same"}
     if value is _MISSING:

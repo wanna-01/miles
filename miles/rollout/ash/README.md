@@ -48,6 +48,12 @@ prompt group it:
    or when local processing fails or times out, so Ash can cancel unfinished
    work and release the complete trajectory record.
 
+For SessionTree-backed agent calls, cancellation continues past the Ash job:
+Ash deletes the active Miles session, Miles cancels that session's in-flight
+upstream HTTP task, and the closed connection lets SGLang abort the request in
+its scheduler. Keeping this translation in Miles avoids coupling Ash to an
+SGLang-specific abort API or to a particular router topology.
+
 `POST` is idempotent. A retry after a lost response may observe `queued`,
 `running`, or a terminal status if Ash already finished the job; trajectories
 are still read from `GET`, not from the POST acknowledgement.
@@ -143,12 +149,18 @@ budgets, and the trusted environment identity:
   "return_rollout_logprobs": false,
   "sampling_params": {"temperature": 0.6, "max_new_tokens": 2048},
   "budgets": {
-    "max_model_calls": 6,
-    "max_tool_calls": 2,
-    "max_wall_time_seconds": 1800
+    "max_model_calls": null,
+    "max_tool_calls": null,
+    "max_wall_time_seconds": 10800
   }
 }
 ```
+
+`max_model_calls` and `max_tool_calls` may be `null`, meaning that Ash does
+not terminate the episode by call count. This is still bounded by
+`max_wall_time_seconds`, cancellation, the model context window, per-turn
+generation limits, and sandbox lifecycle policy. Miles CLI accepts
+`unbounded` for either call-limit flag and serializes it as JSON `null`.
 
 The first `POST /rollout-groups` normally returns a `queued`
 acknowledgement. An idempotent retry returns the job's current status, which
@@ -156,6 +168,17 @@ may already be terminal. Miles polls the job with
 `GET /rollout-groups/{rollout_job_id}`. A completed response contains
 `actual_samples`, `search_branches`, `consumed_budget` and one complete
 trajectory per returned slot:
+
+For a queued or running job, Ash may also return a `progress` object with the
+current coarse phase, cumulative model/tool call counts, completed sample
+count, active sample slot, elapsed and remaining wall time, and the Unix time
+of the last activity update. Miles validates this optional telemetry but does
+not use it to construct training samples or compute loss.
+
+Cancelled and failed terminal results should retain the latest model/tool call
+counts plus elapsed time in `consumed_budget`. This lets Miles and profiling
+consumers distinguish a long right-censored rollout from a failure before any
+useful work was performed.
 
 ```json
 {
@@ -215,6 +238,7 @@ trajectory per returned slot:
       "response_text": "Parent completed.",
       "reward": null,
       "status": "completed",
+      "prompt_token_alignment": "request_exact",
       "metadata": {"environment_checkpoint_id": "opaque-to-Miles"}
     },
     {
@@ -255,6 +279,7 @@ trajectory per returned slot:
       "response_text": "Child completed.",
       "reward": null,
       "status": "completed",
+      "prompt_token_alignment": "request_exact",
       "metadata": {"environment_checkpoint_id": "opaque-to-Miles"}
     }
   ]
@@ -294,6 +319,16 @@ Only assistant-generated spans receive `loss_mask=1`. Prompt tokens, tool
 results, and other environment-provided context remain part of the model input
 but do not contribute directly to the policy loss.
 
+`prompt_token_alignment` defaults to `request_exact`: Miles verifies that the
+trajectory begins with the token IDs allocated by its data source. A trusted
+external harness may instead return `harness_rendered` when it adds a system
+prompt or runtime context before the task. In that mode the first exact token
+prefix captured by the Miles Session Server is used for training, while the
+request's original prompt token IDs remain in
+`metadata.ash_rollout.request_prompt_token_ids` for provenance. This flag does
+not permit Ash to synthesize token IDs; every token and generated span must
+still come from the Session Server.
+
 ## Configuration
 
 Select the backend and provide the rollout service URL:
@@ -314,7 +349,12 @@ separately advertised addresses:
 
 The `--ash-rollout-max-model-calls`, `--ash-rollout-max-tool-calls`, and
 `--ash-rollout-timeout-seconds` options bound the work allowed for one prompt
-group. HTTP request timeout and polling cadence are configured separately.
+group. The wall-time default is 10,800 seconds so long-context agent turns and
+the benchmark verifier can finish without a one-hour right-censoring bias.
+`--ash-rollout-client-grace-seconds` only gives Ash time to publish the
+cancelled terminal result after that server-side deadline; it does not extend
+the rollout budget. HTTP request timeout and polling cadence are configured
+separately.
 
 ## Current scope
 
@@ -344,38 +384,43 @@ profiles, credentials, conversion to a runtime-ready template/snapshot and
 cache lifecycle. A rejected source fails the rollout submission before any
 sandbox is created.
 
-`task_id` currently supplies the AshAgent instance/trace identity. It does not
-by itself initialize a repository, working directory, tool set, or reward; the
-selected environment and prompt must already provide that task context. The
-four-field `environment_ref`, not `task_id`, selects the sandbox artifact.
+`task_id` supplies task/trace identity and may be consumed by an Ash task
+adapter. It does not by itself select a sandbox artifact; the four-field
+`environment_ref` does that. Repository initialization, working directory,
+tool policy and reward remain Ash/task-adapter responsibilities.
 
 Miles serializes its usual sampling controls into `sampling_params`. The
-current AshAgent adapter forwards `model`, `max_tokens`/`max_new_tokens`,
-`temperature`, `top_p`, `top_k`, `stop`, `stop_token_ids`,
-`skip_special_tokens`, `no_stop_trim`, `spaces_between_special_tokens`, and
-`chat_template_kwargs` to the OpenAI-compatible model request. An explicit
-`extra_body` object may carry additional provider fields; a new control still
-needs a coordinated adapter change before Miles can assume it affects
-generation.
+recommended Claude Agent SDK backend maps supported controls into
+`ClaudeAgentOptions` and sends Anthropic Messages requests through Miles'
+session endpoint. Legacy AshAgent strategies retain their OpenAI-compatible
+mapping. A new control still needs a coordinated adapter change before Miles
+can assume it affects generation.
+
+## Claude/Anthropic token semantics
+
+Claude Agent SDK adds a stable system/tool protocol and runtime context. Ash
+therefore returns `prompt_token_alignment=harness_rendered`, and Miles treats
+the token sequence actually recorded by SessionTree as authoritative. System,
+user, tool-result and synthetic continuation tokens receive `loss_mask=0`;
+only assistant `generated_spans` receive `loss_mask=1`.
+
+The Anthropic adapter preserves ordinary system content. It removes only a
+fully matched, per-turn `<total_tokens>...` reminder when the request also
+carries Claude Code's billing marker, preventing a volatile counter from
+rewriting an otherwise reusable SessionTree prefix.
 
 ## Functional validation
 
-Two recorded full training runs (2026-09-11) used, respectively, a prebuilt
-AgentENV template and a dynamically prepared digest-pinned public OCI image.
-Both used a real Ash rollout service, AgentENV/Firecracker backend, Miles
-Session Server, SGLang, and a single-step GRPO/Megatron job. Each prompt group
-returned two trajectories after one environment checkpoint restore, with five
-model calls, one tool call, and two SessionTree leaves. Miles imported both
-trajectories, recomputed old-policy log-probabilities, completed a valid
-optimizer step (`grad_norm=32.4090` for the template and `32.4122` for the OCI
-image), and updated the SGLang weight version from `1` to `2`.
+The current recorded full training run (2026-09-14) used Claude Agent SDK,
+Ash MCP, AgentENV/Firecracker, Miles SessionTree, SGLang/Qwen3.8-27B and one
+GRPO/Megatron step. One environment checkpoint and Claude transcript fork
+produced two trajectories with 3 model calls, 1 tool call and two SessionTree
+leaves. Miles recomputed old-policy log-probabilities, obtained rewards
+`[0, 1]` and advantages `[-1, +1]`, completed a valid optimizer step
+(`grad_norm=14.268937110900879`), and updated SGLang weight version 1 -> 2.
 
-The OCI run additionally exercised digest validation, image preparation,
-`ash-runtime` injection and runtime-ready snapshot reuse before sandbox
-creation. The tested Miles source files were byte-for-byte identical to the
-current integration worktree at the time of the runs. These are interface and
-correctness checks; they do not establish rollout performance, training
-quality, or the effectiveness of a dynamic branch-selection policy.
+This is an interface and correctness check, not evidence of rollout
+performance, training quality, or a dynamic branch-selection policy.
 
 Do not enable rollout routing replay, indexer replay, or rollout sampling-mask
 features with this backend until their per-token payloads are represented in

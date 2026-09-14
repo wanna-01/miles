@@ -1,6 +1,7 @@
 """Anthropic protocol helpers for the session HTTP adapter."""
 
 import json
+import re
 
 from pydantic import ValidationError
 from sglang.srt.entrypoints.anthropic import utils as anthropic_utils
@@ -12,6 +13,8 @@ from miles.rollout.session.core import JSON_MEDIA_TYPE, _render_json
 # Preserve end-to-end error metadata; drop headers tied to the replaced body.
 _ANTHROPIC_ERROR_HEADER_ALLOWLIST = ("www-authenticate", "retry-after", "x-request-id")
 _ANTHROPIC_ERROR_HEADER_PREFIXES = ("x-ratelimit-", "anthropic-ratelimit-")
+_CLAUDE_CODE_BILLING_HEADER_PREFIX = "x-anthropic-billing-header: cc_version="
+_CLAUDE_CODE_TOKEN_BUDGET = re.compile(r"<total_tokens>\d+ tokens left</total_tokens>")
 
 
 def _anthropic_wire_json(model) -> bytes:
@@ -63,15 +66,11 @@ def _validate_anthropic_content_block(block, *, allow_thinking: bool = False) ->
         raise ValueError("tool_reference content blocks are not enabled for this deployment")
     if block.type == "search_result":
         raise ValueError("search_result content blocks are not enabled for this deployment")
-    if block.type == "tool_result" and block.is_error is True:
-        raise ValueError("tool_result is_error=true is not supported by this endpoint")
 
 
 def _validate_anthropic_features(request: AnthropicMessagesRequest) -> None:
     if request.thinking is not None:
         raise ValueError("thinking is not supported by this endpoint")
-    if request.output_config is not None:
-        raise ValueError("output_config is not enabled for this deployment")
     if request.betas:
         raise ValueError("betas is not enabled for this deployment")
     if request.tools:
@@ -90,6 +89,52 @@ def _validate_anthropic_features(request: AnthropicMessagesRequest) -> None:
             if block.type == "tool_result" and isinstance(block.content, list):
                 for nested_block in block.content:
                     _validate_anthropic_content_block(nested_block)
+
+
+def _anthropic_text(content) -> str | None:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list) or len(content) != 1:
+        return None
+    block = content[0]
+    if getattr(block, "type", None) != "text":
+        return None
+    return getattr(block, "text", None)
+
+
+def _strip_claude_code_token_budget_messages(
+    anthropic_request: AnthropicMessagesRequest,
+) -> AnthropicMessagesRequest:
+    """Remove Claude Code's volatile token-counter messages before conversion.
+
+    Claude Code places ``<total_tokens>...`` messages at intermediate system
+    positions. Templates without intermediate-system support merge them into
+    the leading system prompt, rewriting the otherwise reusable prefix on
+    every turn. Only requests carrying Claude Code's private billing marker
+    receive this narrowly scoped normalization; ordinary Anthropic system
+    messages remain untouched.
+    """
+    system = anthropic_request.system
+    system_items = [] if system is None or isinstance(system, str) else system
+    if not any(
+        getattr(item, "type", None) == "text"
+        and str(getattr(item, "text", "")).startswith(
+            _CLAUDE_CODE_BILLING_HEADER_PREFIX
+        )
+        for item in system_items
+    ):
+        return anthropic_request
+
+    messages = [
+        message
+        for message in anthropic_request.messages
+        if not (
+            message.role == "system"
+            and (text := _anthropic_text(message.content)) is not None
+            and _CLAUDE_CODE_TOKEN_BUDGET.fullmatch(text) is not None
+        )
+    ]
+    return anthropic_request.model_copy(update={"messages": messages})
 
 
 def _strip_anthropic_reasoning_history(
@@ -115,6 +160,27 @@ def _strip_anthropic_reasoning_history(
             )
         conversion_messages.append(message)
     return anthropic_request.model_copy(update={"messages": conversion_messages}), reasoning_history
+
+
+def _strip_anthropic_output_config(
+    anthropic_request: AnthropicMessagesRequest,
+) -> tuple[AnthropicMessagesRequest, str | None]:
+    """Extract Claude Code's effort hint before the SGLang conversion.
+
+    Claude Agent SDK sends ``output_config.effort`` even when extended
+    thinking is disabled. Not every SGLang version used by Miles understands
+    that newer Anthropic field, so Miles translates the stable effort subset
+    itself and passes an otherwise ordinary request to the converter.
+    """
+    output_config = anthropic_request.output_config
+    if output_config is None:
+        return anthropic_request, None
+    if output_config.task_budget is not None:
+        raise ValueError("output_config.task_budget is not supported by this endpoint")
+    effort = output_config.effort
+    if effort == "xhigh":
+        effort = "max"
+    return anthropic_request.model_copy(update={"output_config": None}), effort
 
 
 def _restore_anthropic_reasoning_history(openai_body: dict, reasoning_history: list[str | None]) -> None:

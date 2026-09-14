@@ -29,6 +29,12 @@ def test_rows_carry_the_raw_conversation():
     assert row["messages"] == MESSAGES
 
 
+def test_rows_carry_the_ash_importer_conversation():
+    sample = make_sample(metadata={"ash_rollout": {"messages": MESSAGES}})
+    (row,) = trajectory_rows([sample])
+    assert row["messages"] == MESSAGES
+
+
 def test_rows_skip_samples_without_a_conversation():
     with_messages = make_sample(index=1, metadata={"messages": MESSAGES})
     without = make_sample(index=2)

@@ -8,6 +8,7 @@ HTTP-agnostic: the FastAPI adapter (``sessions.py`` + ``server.py``) turns each 
 - ``collect_samples`` assembles training Samples from the session's records on the server (compute -> truncate -> merge, synchronously on the loop like the lock-free ``get_session``); deterministic assembly failures return 422 with the assertion text.
 """
 
+import asyncio
 import json
 import logging
 import time
@@ -64,6 +65,30 @@ def _lcp_len(a: list[int], b: list[int]) -> int:
         if a[i] != b[i]:
             return i
     return n
+
+
+def cap_completion_to_context(request_body: dict, prompt_token_ids: list[int], args) -> None:
+    """Keep a per-turn completion request inside the configured model context.
+
+    Agent rollouts may deliberately use a very high per-turn ceiling so the
+    sampling limit does not right-censor profiling.  OpenAI-compatible servers
+    reject ``prompt + max_tokens > context`` before decoding, however.  The
+    session server is the first component that knows the exact rendered input
+    IDs, so it owns the final context-aware cap.
+    """
+    context_limit = getattr(args, "rollout_max_context_len", None)
+    if context_limit is None:
+        return
+    remaining = int(context_limit) - len(prompt_token_ids)
+    if remaining <= 0:
+        raise MessageValidationError(
+            f"rendered prompt has {len(prompt_token_ids)} tokens, which leaves no "
+            f"completion capacity in rollout_max_context_len={context_limit}"
+        )
+    for field in ("max_tokens", "max_new_tokens"):
+        value = request_body.get(field)
+        if value is not None:
+            request_body[field] = min(int(value), remaining)
 
 
 def _samples_response(payload: bytes) -> Response:
@@ -213,7 +238,20 @@ def extract_completion(result: dict) -> tuple:
     ``UpstreamResponseError``.
     """
     response = json.loads(result["response_body"])
-    choice = response.get("choices", [{}])[0]
+    if not isinstance(response, dict):
+        raise UpstreamResponseError("model endpoint returned a non-object response")
+    choices = response.get("choices")
+    if not isinstance(choices, list) or not choices:
+        detail = response.get("error")
+        if isinstance(detail, dict):
+            detail = detail.get("message") or detail.get("type")
+        suffix = f": {detail}" if detail else ""
+        raise UpstreamResponseError(
+            "model endpoint returned no completion choices" + suffix
+        )
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        raise UpstreamResponseError("model endpoint returned a non-object completion choice")
 
     meta_info = choice.get("meta_info")
     if not isinstance(meta_info, dict) or "output_token_logprobs" not in meta_info:
@@ -251,6 +289,10 @@ class SessionCore:
         self.registry = registry
         self.args = args
         self.instance_id = session_server_instance_id
+        # Long model calls run without holding the session lock.  Keep their
+        # tasks keyed by session so DELETE can cancel the upstream HTTP request
+        # immediately instead of waiting for generation to finish.
+        self._inflight_proxy_tasks: dict[str, set[asyncio.Task]] = {}
         # Derived from pause_generation_mode at server bootstrap; session code
         # must depend on this capability, never on the weight-update mode.
         self.use_addition_r3 = use_addition_r3
@@ -275,7 +317,15 @@ class SessionCore:
         request_body["routed_experts_start_len"] = previous_rows
 
     async def health(self) -> Response:
-        body = {"status": "ok"}
+        context_limit = getattr(self.args, "rollout_max_context_len", None)
+        capabilities = ["anthropic-messages"]
+        if context_limit is not None:
+            capabilities.append("context-aware-completion-cap")
+        body = {
+            "status": "ok",
+            "capabilities": capabilities,
+            "rollout_max_context_len": context_limit,
+        }
         if self.instance_id is not None:
             body["session_server_instance_id"] = self.instance_id
         return Response(content=_render_json(body), status_code=200, media_type=JSON_MEDIA_TYPE)
@@ -344,13 +394,52 @@ class SessionCore:
         if session.closing:
             raise SessionNotFoundError(f"session not found: session_id={session_id}")
         session.closing = True
-        # Acquire the lock so an in-flight chat finishes before we drop the session.
+        # Acquire the lock before enumerating tasks: a chat that was already
+        # preparing under this lock must get a chance to register its proxy
+        # task, otherwise DELETE could miss it in this narrow race window.
         await session.lock.acquire()
         try:
+            # Cancelling the httpx request closes the upstream connection.
+            # SGLang observes that disconnect and aborts the generation.
+            tasks = tuple(self._inflight_proxy_tasks.get(session_id, ()))
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
             self.registry.remove_session(session_id)
         finally:
             session.lock.release()
         return Response(status_code=204)
+
+    def _start_session_proxy(
+        self,
+        session_id: str,
+        request: ProxyRequest,
+        path: str,
+        *,
+        body: bytes,
+        headers: dict,
+    ) -> asyncio.Task:
+        """Start and register one cancellable upstream request.
+
+        Call this while holding the session lock so DELETE cannot observe the
+        session between request preparation and task registration.
+        """
+        task = asyncio.create_task(
+            self.backend.do_proxy(request, path, body=body, headers=headers)
+        )
+        self._inflight_proxy_tasks.setdefault(session_id, set()).add(task)
+        return task
+
+    async def _finish_session_proxy(self, session_id: str, task: asyncio.Task) -> dict:
+        try:
+            return await task
+        finally:
+            tasks = self._inflight_proxy_tasks.get(session_id)
+            if tasks is not None:
+                tasks.discard(task)
+                if not tasks:
+                    self._inflight_proxy_tasks.pop(session_id, None)
 
     async def chat_completions(
         self, session_id: str, *, method: str, query: str, headers: dict, body: bytes
@@ -384,6 +473,7 @@ class SessionCore:
                 message_matcher=self.registry.message_matcher,
             )
             request_body["input_ids"] = prompt_token_ids
+            cap_completion_to_context(request_body, prompt_token_ids, self.args)
             logger.debug("Using TITO input_ids: %d tokens", len(prompt_token_ids))
 
             # prepare_pretokenized applied any retry rollback, so token_ids is
@@ -392,13 +482,17 @@ class SessionCore:
 
             proxy_body = json.dumps(request_body).encode()
             expected_num_assistant = session.num_assistant
+            proxy_task = self._start_session_proxy(
+                session_id,
+                ProxyRequest(method=method, query=query),
+                "v1/chat/completions",
+                body=proxy_body,
+                headers={**headers, "X-SMG-Routing-Key": session_id},
+            )
         # --- lock released ---
 
         # --- Phase 2: proxy to backend (NO lock held) ---
-        headers = {**headers, "X-SMG-Routing-Key": session_id}
-        result = await self.backend.do_proxy(
-            ProxyRequest(method=method, query=query), "v1/chat/completions", body=proxy_body, headers=headers
-        )
+        result = await self._finish_session_proxy(session_id, proxy_task)
 
         # Non-200 (e.g. 400 context too long) passes through unrecorded so the
         # agent can retry or handle the error.

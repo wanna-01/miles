@@ -12,7 +12,8 @@ logger = logging.getLogger(__name__)
 
 def trajectory_rows(samples: list[Sample]) -> list[dict]:
     """One row per sample that recorded a raw conversation
-    (``metadata["messages"]``, attached by the session / multi_turn paths).
+    (``metadata["messages"]``, attached by the session / multi_turn paths, or
+    ``metadata["ash_rollout"]["messages"]``, attached by the Ash importer).
 
     ``sample_occurrence`` counts over the FULL sample list -- the numbering the
     dashboard uses everywhere -- not over the recorded subset, so a sample
@@ -23,7 +24,10 @@ def trajectory_rows(samples: list[Sample]) -> list[dict]:
     for sample in samples:
         occurrence = occurrences[sample.index]
         occurrences[sample.index] += 1
-        messages = sample.metadata.get("messages") if sample.metadata else None
+        metadata = sample.metadata or {}
+        messages = metadata.get("messages")
+        if messages is None:
+            messages = metadata.get("ash_rollout", {}).get("messages")
         if messages is None:
             continue
         rows.append(

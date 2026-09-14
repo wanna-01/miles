@@ -92,7 +92,19 @@ def loose_tool_call_message_matches(stored: dict[str, Any], replayed: dict[str, 
     except RecursionError:
         pass
     for key in ("role", "content", "reasoning_content"):
-        if _normalize_value(stored.get(key)) != _normalize_value(replayed.get(key)):
+        stored_value = _normalize_value(stored.get(key))
+        replayed_value = _normalize_value(replayed.get(key))
+        if (
+            key == "content"
+            and stored.get("role") == replayed.get("role") == "assistant"
+            and stored.get("tool_calls")
+            and replayed.get("tool_calls")
+        ):
+            if isinstance(stored_value, str) and not stored_value.strip():
+                stored_value = None
+            if isinstance(replayed_value, str) and not replayed_value.strip():
+                replayed_value = None
+        if stored_value != replayed_value:
             return False
     stored_calls = _normalize_value(stored.get("tool_calls"))
     replayed_calls = _normalize_value(replayed.get("tool_calls"))

@@ -27,6 +27,18 @@ from miles.utils.tracking_utils.ci_history import RECORD_DIR_ENV
 logger = logging.getLogger(__name__)
 
 
+def _optional_call_limit(value: str) -> int | None:
+    """Parse a finite call limit or an explicit unbounded sentinel."""
+    if value.strip().lower() in {"none", "null", "unbounded", "infinite"}:
+        return None
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "expected an integer or one of: unbounded, infinite, none, null"
+        ) from exc
+
+
 def resolve_rollout_function_paths(args) -> tuple[str, str]:
     """The (rollout, eval) function paths the arguments select."""
     if use_legacy_rollout_v1():
@@ -552,8 +564,17 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--ash-rollout-timeout-seconds",
                 type=float,
-                default=1800.0,
+                default=10800.0,
                 help="Maximum wall time for one Ash prompt-group rollout.",
+            )
+            parser.add_argument(
+                "--ash-rollout-client-grace-seconds",
+                type=float,
+                default=30.0,
+                help=(
+                    "Additional time for Ash to publish its terminal state after the "
+                    "server-side rollout deadline. This does not extend the rollout budget."
+                ),
             )
             parser.add_argument(
                 "--ash-rollout-http-timeout-seconds",
@@ -563,15 +584,21 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             )
             parser.add_argument(
                 "--ash-rollout-max-model-calls",
-                type=int,
+                type=_optional_call_limit,
                 default=100,
-                help="Maximum model calls Ash may use for one prompt group.",
+                help=(
+                    "Maximum model calls Ash may use for one prompt group, or "
+                    "'unbounded' to rely on wall time, cancellation and model context."
+                ),
             )
             parser.add_argument(
                 "--ash-rollout-max-tool-calls",
-                type=int,
+                type=_optional_call_limit,
                 default=100,
-                help="Maximum tool calls Ash may use for one prompt group.",
+                help=(
+                    "Maximum tool calls Ash may use for one prompt group, or "
+                    "'unbounded' to rely on wall time and cancellation."
+                ),
             )
             parser.add_argument(
                 "--fully-async",

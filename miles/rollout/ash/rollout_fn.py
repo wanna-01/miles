@@ -48,6 +48,7 @@ class AshRolloutFn:
         self._configured_session_endpoint = getattr(self._args, "ash_rollout_session_server_endpoint", None)
         self._poll_interval_seconds = self._args.ash_rollout_poll_interval_seconds
         self._rollout_timeout_seconds = self._args.ash_rollout_timeout_seconds
+        self._client_grace_seconds = self._args.ash_rollout_client_grace_seconds
         self._http_timeout_seconds = self._args.ash_rollout_http_timeout_seconds
         self._tokenizer = None
         _validate_configuration(self._args)
@@ -126,7 +127,7 @@ class AshRolloutFn:
                     request.rollout_job_id,
                     poll_interval_seconds=self._poll_interval_seconds,
                 ),
-                timeout=self._rollout_timeout_seconds,
+                timeout=self._rollout_timeout_seconds + self._client_grace_seconds,
             )
             _validate_result_contract(request, result)
             samples = import_ash_rollout_result(result, slot_samples)
@@ -222,7 +223,7 @@ class AshRolloutFn:
             return list(sample.tokens)
         if any(item.tokens for item in group[1:]):
             raise ValueError("all samples in an Ash prompt group must agree on whether prompt token IDs are set")
-        if any(item.multimodal_inputs for item in group):
+        if any(_has_multimodal_inputs(item.multimodal_inputs) for item in group):
             raise NotImplementedError("AshRolloutFn does not support multimodal prompt tokenization yet")
 
         if self._tokenizer is None:
@@ -240,7 +241,13 @@ class AshRolloutFn:
             tools=tools,
             tokenize=True,
             add_generation_prompt=True,
+            **(getattr(self._args, "apply_chat_template_kwargs", None) or {}),
         )
+
+
+def _has_multimodal_inputs(multimodal_inputs: dict[str, Any] | None) -> bool:
+    """Match Miles' convention that an all-None media mapping is text-only."""
+    return bool(multimodal_inputs) and any(value is not None for value in multimodal_inputs.values())
 
 
 def _required_arg(args: Any, name: str) -> Any:
@@ -293,13 +300,18 @@ def _validate_configuration(args: Any) -> None:
     positive_values = {
         "ash_rollout_poll_interval_seconds": args.ash_rollout_poll_interval_seconds,
         "ash_rollout_timeout_seconds": args.ash_rollout_timeout_seconds,
+        "ash_rollout_client_grace_seconds": args.ash_rollout_client_grace_seconds,
         "ash_rollout_http_timeout_seconds": args.ash_rollout_http_timeout_seconds,
-        "ash_rollout_max_model_calls": args.ash_rollout_max_model_calls,
     }
+    if args.ash_rollout_max_model_calls is not None:
+        positive_values["ash_rollout_max_model_calls"] = args.ash_rollout_max_model_calls
     for name, value in positive_values.items():
         if value <= 0:
             raise ValueError(f"--{name.replace('_', '-')} must be greater than zero")
-    if args.ash_rollout_max_tool_calls < 0:
+    if (
+        args.ash_rollout_max_tool_calls is not None
+        and args.ash_rollout_max_tool_calls < 0
+    ):
         raise ValueError("--ash-rollout-max-tool-calls must be non-negative")
 
 

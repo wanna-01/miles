@@ -5,6 +5,7 @@ import time
 from starlette.responses import Response
 
 from miles.rollout.session.core import (
+    cap_completion_to_context,
     JSON_MEDIA_TYPE,
     ProxyRequest,
     SessionCore,
@@ -43,6 +44,16 @@ class SessionCoreV2(SessionCore):
         self.sample_picker = load_function(args.session_sample_picker_path, sync_required=True)
         self.sample_postprocessor = load_function(args.session_sample_postprocessor_path, sync_required=True)
 
+    async def health(self) -> Response:
+        response = await super().health()
+        body = json.loads(response.body)
+        body["capabilities"].append("session-tree-v2")
+        return Response(
+            content=_render_json(body),
+            status_code=response.status_code,
+            media_type=JSON_MEDIA_TYPE,
+        )
+
     def _session_metadata(self, session_id: str, session) -> dict:
         """Mirrors ``core.SessionCore._session_metadata``: token ids come from
         the active path, plus the ``tree`` block."""
@@ -57,6 +68,13 @@ class SessionCoreV2(SessionCore):
         metadata["accumulated_token_ids"] = session.active_token_ids()
         metadata["max_trim_tokens"] = self.registry.tito_tokenizer.max_trim_tokens
         metadata["tree"] = tree_metadata(session)
+        metadata["tree_records"] = {
+            str(node.seq): {
+                "record": node.record.model_dump(mode="json"),
+                "token_ids": list(node.token_ids),
+            }
+            for node in session.tree.nodes
+        }
         return metadata
 
     async def get_session(self, session_id: str) -> Response:
@@ -159,19 +177,24 @@ class SessionCoreV2(SessionCore):
                 tito_tokenizer=tito_tokenizer,
             )
             request_body["input_ids"] = prompt_token_ids
+            cap_completion_to_context(request_body, prompt_token_ids, self.args)
             logger.debug("Using TITO input_ids: %d tokens", len(prompt_token_ids))
 
             self._maybe_request_addition_r3(request_body, session.active_token_ids(), prompt_token_ids)
 
             proxy_body = json.dumps(request_body).encode()
             attach_parent = session.active_leaf
+            proxy_task = self._start_session_proxy(
+                session_id,
+                ProxyRequest(method=method, query=query),
+                "v1/chat/completions",
+                body=proxy_body,
+                headers={**headers, "X-SMG-Routing-Key": session_id},
+            )
         # --- lock released ---
 
         # --- Phase 2: proxy to backend (NO lock held) ---
-        headers = {**headers, "X-SMG-Routing-Key": session_id}
-        result = await self.backend.do_proxy(
-            ProxyRequest(method=method, query=query), "v1/chat/completions", body=proxy_body, headers=headers
-        )
+        result = await self._finish_session_proxy(session_id, proxy_task)
 
         # Non-200 (e.g. 400 context too long) passes through unrecorded so the
         # agent can retry or handle the error.

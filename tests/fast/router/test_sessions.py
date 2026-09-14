@@ -14,6 +14,10 @@ import pytest
 import requests
 from fastapi.responses import JSONResponse
 
+from miles.rollout.session.core import cap_completion_to_context, extract_completion
+from miles.rollout.session.core import SessionCore
+from miles.rollout.session.v2.core import SessionCoreV2
+from miles.rollout.session.errors import UpstreamResponseError
 from miles.rollout.session.server import SessionServer
 from miles.utils.chat_template_utils import strict_message_matches
 from miles.utils.chat_template_utils.tito_tokenizer import TITOTokenizer
@@ -34,6 +38,37 @@ def _post_chat(url: str, session_id: str, payload: dict) -> requests.Response:
 def _parse_sse(body: str) -> list[str]:
     """Return the data payload of each SSE event, in order."""
     return [block[len("data: ") :] for block in body.split("\n\n") if block.startswith("data: ")]
+
+
+def test_extract_completion_rejects_empty_choices_with_context():
+    result = {
+        "response_body": json.dumps(
+            {"choices": [], "error": {"message": "backend overloaded"}}
+        ).encode()
+    }
+
+    with pytest.raises(
+        UpstreamResponseError,
+        match="no completion choices: backend overloaded",
+    ):
+        extract_completion(result)
+
+
+def test_completion_limit_is_capped_by_exact_rendered_context():
+    request = {"max_tokens": 262_144}
+    args = SimpleNamespace(rollout_max_context_len=262_144)
+
+    cap_completion_to_context(request, [1] * 2_843, args)
+
+    assert request["max_tokens"] == 259_301
+
+
+def test_completion_limit_is_unchanged_without_context_configuration():
+    request = {"max_tokens": 262_144}
+
+    cap_completion_to_context(request, [1] * 2_843, SimpleNamespace())
+
+    assert request["max_tokens"] == 262_144
 
 
 @pytest.fixture(scope="class")
@@ -100,9 +135,38 @@ class TestSessionRoutes:
         first_body = first.json()
         second_body = second.json()
         assert first_body["status"] == "ok"
+        assert first_body["capabilities"] == []
+        assert first_body["rollout_max_context_len"] is None
         assert second_body["status"] == "ok"
         assert re.fullmatch(r"[0-9a-f]{32}", first_body["session_server_instance_id"])
         assert second_body["session_server_instance_id"] == first_body["session_server_instance_id"]
+
+    def test_health_reports_context_capability_when_configured(self):
+        core = SessionCore(
+            backend=SimpleNamespace(),
+            registry=SimpleNamespace(),
+            args=SimpleNamespace(rollout_max_context_len=262_144),
+        )
+
+        response = asyncio.run(core.health())
+        body = json.loads(response.body)
+
+        assert body["capabilities"] == ["context-aware-completion-cap"]
+        assert body["rollout_max_context_len"] == 262_144
+
+    def test_v2_health_reports_tree_and_context_capabilities(self):
+        core = object.__new__(SessionCoreV2)
+        core.args = SimpleNamespace(rollout_max_context_len=262_144)
+        core.instance_id = "server-v2"
+
+        response = asyncio.run(core.health())
+        body = json.loads(response.body)
+
+        assert body["capabilities"] == [
+            "context-aware-completion-cap",
+            "session-tree-v2",
+        ]
+        assert body["session_server_instance_id"] == "server-v2"
 
     def test_create_session(self, router_env):
         response = requests.post(f"{router_env.url}/sessions", timeout=5.0)
